@@ -69,7 +69,12 @@ Open http://localhost:8000 and test commands like:
 
 ## Configuration
 - `COMMAND_PREFIX`: Command prefix (default `!`).
-- `EPIC_CLIENT_ID` / `EPIC_CLIENT_SECRET`: OAuth client credentials used for device code flow.
+- `EPIC_SWITCH_BASIC`: Optional override for the Epic SWITCH OAuth client Basic token (base64(client_id:client_secret)).
+- `EPIC_ANDROID_BASIC`: Optional override for the Epic ANDROID OAuth client Basic token (base64(client_id:client_secret)).
+
+Notes:
+- The server will try SWITCH first, then ANDROID. If an override is not provided via environment variables, embedded defaults will be used where available.
+- For localhost safety, the device-code flow does not require or use any redirect/callback URLs.
 
 ## Notes for integrating with a real Fortnite bot
 - The current commands simulate actions and log to the console. Integrate your Fortnite SDK (e.g., `rebootpy`) inside `Bot` and its cogs. Do not change command signatures so that both in-game/DM and web UI control remain compatible.
