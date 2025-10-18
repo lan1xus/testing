@@ -8,11 +8,14 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 
 from .event_bus import EventBus
 
-# Optional rebootpy import (no side effects on import)
+# Optional reboot library import (supports rebootpy and reboot)
 try:  # pragma: no cover - optional dependency at runtime
-    import reboot as _reboot  # type: ignore
-except Exception:  # pragma: no cover - library might not be installed in CI
-    _reboot = None  # type: ignore
+    import rebootpy as _reboot  # type: ignore
+except Exception:  # pragma: no cover - library might not be installed
+    try:
+        import reboot as _reboot  # type: ignore
+    except Exception:  # pragma: no cover
+        _reboot = None  # type: ignore
 
 
 # -----------------------------
@@ -445,37 +448,76 @@ class Bot:
         try:
             # Build client if needed
             if self._reboot_client is None:
+                # Resolve classes from either rebootpy or reboot
+                device_auth_cls = getattr(_reboot, "DeviceAuth", None) or getattr(getattr(_reboot, "auth", object), "DeviceAuth", None)
                 advanced_auth_cls = getattr(_reboot, "AdvancedAuth", None) or getattr(getattr(_reboot, "auth", object), "AdvancedAuth", None)
                 client_cls = getattr(_reboot, "Client", None)
-                if not advanced_auth_cls or not client_cls:
+                if not client_cls or (not device_auth_cls and not advanced_auth_cls):
                     return (False, "reboot library missing components")
-                adv = advanced_auth_cls(device_auth_details=self._device_auth_details)
-                # Try passing minimal args; library-specific kwargs are optional
+
+                # Extract device auth details
+                details = self._device_auth_details or {}
+                device_id = details.get("device_id") or details.get("deviceId")
+                account_id = details.get("account_id") or details.get("accountId")
+                secret = details.get("secret")
+
+                # Prefer DeviceAuth when details exist; otherwise AdvancedAuth
+                if device_id and account_id and secret and device_auth_cls:
+                    auth_obj = device_auth_cls(
+                        device_id=device_id,
+                        account_id=account_id,
+                        secret=secret,
+                    )
+                elif device_id and account_id and secret and advanced_auth_cls:
+                    auth_obj = advanced_auth_cls(
+                        device_id=device_id,
+                        account_id=account_id,
+                        secret=secret,
+                        prompt_device_code=False,
+                    )
+                elif advanced_auth_cls:
+                    # Fallback (should not normally be used since we manage device code ourselves)
+                    auth_obj = advanced_auth_cls(prompt_device_code=False)
+                else:
+                    return (False, "reboot library missing components")
+
+                # Construct client
                 try:
-                    self._reboot_client = client_cls(auth=adv)
+                    self._reboot_client = client_cls(auth_obj)
                 except TypeError:
-                    # Fallback to positional if needed
-                    self._reboot_client = client_cls(adv)
+                    self._reboot_client = client_cls(auth=auth_obj)
+
             # Start/connect without blocking the event loop
-            start_fn = getattr(self._reboot_client, "start", None) or getattr(self._reboot_client, "run", None)
-            if start_fn is None:
+            start_attr = getattr(self._reboot_client, "start", None)
+            if start_attr is None:
                 return (False, "reboot client has no start method")
-            if asyncio.iscoroutinefunction(start_fn):
-                # schedule async start
-                asyncio.create_task(start_fn())  # type: ignore[misc]
+
+            try:
+                ctx = start_attr()
+            except TypeError:
+                # Some implementations expose async start
+                res = start_attr()
+                if asyncio.iscoroutine(res):
+                    asyncio.create_task(res)  # type: ignore[misc]
             else:
-                # offload potential blocking start to a thread
+                # StartContext from rebootpy is awaitable; schedule it
                 try:
-                    loop = asyncio.get_running_loop()
-                    loop.run_in_executor(None, start_fn)
+                    asyncio.ensure_future(ctx)  # type: ignore[arg-type]
                 except Exception:
-                    try:
-                        start_fn()
-                    except Exception:
-                        pass
+                    pass
+
+            # Optionally wait for readiness briefly
+            try:
+                wait_ready = getattr(self._reboot_client, "wait_until_ready", None)
+                if callable(wait_ready):
+                    await asyncio.wait_for(wait_ready(), timeout=15)
+            except Exception:
+                pass
+
             # Optimistically mark online/ready; underlying client will maintain the session
             self.online = True
             self.ready = True
+
             # Try to get party info from client if available
             try:
                 party_obj = getattr(self._reboot_client, "party", None)
