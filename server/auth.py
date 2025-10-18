@@ -140,6 +140,10 @@ class AuthManager:
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
 
+        # Device code metadata
+        self._device_code_expires_at: Optional[float] = None
+        self._poll_interval_seconds: float = 2.0
+
     @property
     def verification_uri_complete(self) -> Optional[str]:
         return self._verification_uri_complete
@@ -176,6 +180,8 @@ class AuthManager:
             self._refresh_token = None
             self._stop_poll = True
             self._used_platform = None
+            self._device_code_expires_at = None
+            self._poll_interval_seconds = 2.0
 
     def _resolve_basic_candidates(self) -> List[Tuple[str, str]]:
         """Return a list of (PLATFORM, basic_b64) candidates to try in order."""
@@ -198,7 +204,7 @@ class AuthManager:
         return out
 
     async def _client_credentials_token(self, session: aiohttp.ClientSession, basic_b64: str) -> Optional[str]:
-        headers = {"Authorization": f"basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+        headers = {"Authorization": f"Basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
         data = {"grant_type": "client_credentials"}
         async with session.post(TOKEN_ENDPOINT, headers=headers, data=data) as resp:
             try:
@@ -208,14 +214,10 @@ class AuthManager:
         return payload.get("access_token")
 
     async def _request_device_code(self, session: aiohttp.ClientSession, basic_b64: str) -> Dict[str, Any]:
-        # Obtain an app access token first via client_credentials, then request a device code
-        app_token = await self._client_credentials_token(session, basic_b64)
-        if not app_token:
-            return {"error": "invalid_client", "error_description": "Failed to obtain app access token"}
-
-        headers = {"Authorization": f"bearer {app_token}", "Content-Type": "application/x-www-form-urlencoded"}
-        # The deviceAuthorization endpoint does not require a body for default scope
-        async with session.post(DEVICE_AUTHZ_ENDPOINT, headers=headers, data={}) as resp:
+        headers = {"Authorization": f"Basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+        # Request device code with explicit scopes to ensure a refresh token is granted
+        data = {"scope": "basic_profile friends_list presence openid offline_access"}
+        async with session.post(DEVICE_AUTHZ_ENDPOINT, headers=headers, data=data) as resp:
             payload: Dict[str, Any]
             try:
                 payload = await resp.json()
@@ -249,6 +251,8 @@ class AuthManager:
         verification_uri_complete: Optional[str] = None
         used_basic: Optional[str] = None
         used_platform: Optional[str] = None
+        expires_in: Optional[int] = None
+        interval: Optional[int] = None
 
         for platform, basic_b64 in candidates:
             payload = await self._request_device_code(session, basic_b64)
@@ -258,6 +262,8 @@ class AuthManager:
             if device_code and verification_uri_complete and not err:
                 used_basic = basic_b64
                 used_platform = platform
+                expires_in = payload.get("expires_in")
+                interval = payload.get("interval")
                 break
             # If authorization server says invalid_client, fall through and try next
             # Record the last error in status for visibility
@@ -278,6 +284,17 @@ class AuthManager:
             self._status.error = None
             self._status.last_event = "device_code_acquired"
             self._used_platform = used_platform
+            # Capture expiry and recommended polling interval
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if isinstance(expires_in, (int, float)) and float(expires_in) > 0:
+                self._device_code_expires_at = now_ts + float(expires_in)
+            else:
+                self._device_code_expires_at = None
+            if isinstance(interval, (int, float)) and float(interval) > 0:
+                self._poll_interval_seconds = float(interval)
+            else:
+                # keep at least 2 seconds between polls by default
+                self._poll_interval_seconds = max(self._poll_interval_seconds, 2.0)
 
         # Fire-and-forget poller
         asyncio.create_task(self._poll_for_completion(used_basic))
@@ -287,16 +304,21 @@ class AuthManager:
     async def _poll_for_completion(self, basic_b64: str) -> None:
         # Poll token endpoint with device_code to exchange for an access token
         session = await self._get_session()
-        headers = {"Authorization": f"basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+        headers = {"Authorization": f"Basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
 
         while True:
-            await self._sleep(2.0)
+            # Read current state
             async with self._lock:
                 if self._stop_poll:
                     return
                 device_code = self._pending_device_code
+                poll_delay = self._poll_interval_seconds or 2.0
+                expires_at = self._device_code_expires_at
             if not device_code:
                 return
+
+            await self._sleep(poll_delay)
+
             data = {"grant_type": "device_code", "device_code": device_code}
             async with session.post(TOKEN_ENDPOINT, headers=headers, data=data) as resp:
                 try:
@@ -305,10 +327,29 @@ class AuthManager:
                     token_payload = {"error": f"http_{resp.status}"}
 
             error = token_payload.get("error")
-            if error in ("authorization_pending", "slow_down"):
+            if error == "authorization_pending":
                 async with self._lock:
                     self._status.last_event = "authorization_pending"
                 continue
+            if error == "slow_down":
+                async with self._lock:
+                    self._status.last_event = "slow_down"
+                    # Increase polling interval modestly up to a ceiling
+                    self._poll_interval_seconds = min((self._poll_interval_seconds or poll_delay) + 1.0, 10.0)
+                continue
+            if error in ("invalid_grant", "invalid_request"):
+                # Treat as pending until code expires; some backends transiently respond with invalid_grant
+                now_ts = datetime.now(timezone.utc).timestamp()
+                if expires_at is None or now_ts < expires_at:
+                    async with self._lock:
+                        self._status.last_event = "invalid_grant_pending"
+                    continue
+                async with self._lock:
+                    self._status.error = "Device code expired"
+                    self._status.pending = False
+                    self._pending_device_code = None
+                    self._status.last_event = "device_flow_failed"
+                return
             if error:
                 async with self._lock:
                     self._status.error = f"Device flow failed: {error}"
@@ -342,12 +383,12 @@ class AuthManager:
                     if android_b64:
                         # Get exchange code using current access token
                         exch_url = f"{OAUTH_BASE}/exchange"
-                        async with session.get(exch_url, headers={"Authorization": f"bearer {access_token}"}) as r1:
+                        async with session.get(exch_url, headers={"Authorization": f"Bearer {access_token}"}) as r1:
                             exch_payload = await r1.json()
                         exch_code = (exch_payload or {}).get("code")
                         if exch_code:
                             # Exchange for ANDROID token
-                            headers2 = {"Authorization": f"basic {android_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+                            headers2 = {"Authorization": f"Basic {android_b64}", "Content-Type": "application/x-www-form-urlencoded"}
                             data2 = {"grant_type": "exchange_code", "exchange_code": exch_code}
                             async with session.post(TOKEN_ENDPOINT, headers=headers2, data=data2) as r2:
                                 android_token_payload = await r2.json()
@@ -397,7 +438,7 @@ class AuthManager:
 
     async def _fetch_user_details(self, access_token: str, account_id: str) -> Dict[str, Any]:
         session = await self._get_session()
-        headers = {"Authorization": f"bearer {access_token}"}
+        headers = {"Authorization": f"Bearer {access_token}"}
         url = f"{ACCOUNT_BASE}/public/account/{account_id}"
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
@@ -406,7 +447,7 @@ class AuthManager:
 
     async def _create_device_auth(self, access_token: str, account_id: str) -> DeviceAuth:
         session = await self._get_session()
-        headers = {"Authorization": f"bearer {access_token}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         url = f"{ACCOUNT_BASE}/public/account/{account_id}/deviceAuth"
         async with session.post(url, headers=headers, json={}) as resp:
             if resp.status != 200 and resp.status != 201:
