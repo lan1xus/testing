@@ -1,15 +1,24 @@
 import asyncio
 import logging
+import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Set
+from typing import Any, Dict, Set, List, Callable, Awaitable
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from bot.fortnite_bot import create_bot, start_bot, WebCtx, Bot
+from bot.fortnite_bot import (
+    create_bot,
+    start_bot,
+    WebCtx,
+    Bot,
+    BotConfig,
+    party_snapshot,
+    status_summary,
+)
 from server.auth import AuthManager
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -20,7 +29,8 @@ logger = logging.getLogger("fortnite_web_server")
 logger.setLevel(logging.INFO)
 _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
-logger.addHandler(_handler)
+if not logger.handlers:
+    logger.addHandler(_handler)
 
 app = FastAPI(title="Fortnite Bot Web UI")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -74,30 +84,46 @@ class BroadcastManager:
 
 
 broadcaster = BroadcastManager()
-bot: Bot = create_bot()
+
+# Build bot config and instance
+_bot_config = BotConfig(
+    command_prefix=os.environ.get("COMMAND_PREFIX", "!"),
+    device_auths_path=BASE_DIR / "device_auths.json",
+)
+bot: Bot = create_bot(_bot_config)
+
 _bot_task: asyncio.Task | None = None
 _auth_task: asyncio.Task | None = None
+_bus_unsubs: List[Callable[[], Awaitable[None]]] = []
 auth_manager = AuthManager(storage_path=BASE_DIR / "device_auths.json")
 
-
 state: Dict[str, Any] = {
-    "bot": bot.get_status(),
+    "bot": status_summary(bot),
     "auth": auth_manager.status(),
-    "party": bot.get_party_status(),
+    "party": party_snapshot(bot),
 }
 
 
-async def emit_status(kind: str, payload: Dict[str, Any]) -> None:
-    # Update in-memory state and broadcast a delta
-    state[kind] = payload
-    await broadcaster.broadcast_json({"type": "status", "data": {kind: payload}})
+async def _on_event(topic: str, payload: Dict[str, Any]) -> None:
+    if topic == "bot.status":
+        state["bot"] = payload
+        await broadcaster.broadcast_json({"type": "status", "data": {"bot": payload}})
+    elif topic.startswith("party."):
+        state["party"] = payload
+        await broadcaster.broadcast_json({"type": "status", "data": {"party": payload}})
+    else:
+        # Generic forwarding under "evt" type for debugging
+        await broadcaster.broadcast_json({"type": "evt", "topic": topic, "data": payload})
 
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    global _bot_task, _auth_task
+    global _bot_task, _auth_task, _bus_unsubs
     logger.info("Starting bot background task...")
-    bot.set_status_emitter(emit_status)
+    # Subscribe to bot event bus
+    unsub1 = await bot.event_bus.on("bot.status", _on_event)
+    unsub2 = await bot.event_bus.on("party.update", _on_event)
+    _bus_unsubs = [unsub1, unsub2]
     _bot_task = asyncio.create_task(start_bot(bot))
 
     async def auth_watchdog() -> None:
@@ -115,7 +141,7 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    global _bot_task, _auth_task
+    global _bot_task, _auth_task, _bus_unsubs
     logger.info("Shutting down bot...")
     await bot.stop()
     if _bot_task:
@@ -125,6 +151,13 @@ async def on_shutdown() -> None:
             logger.warning("Bot task did not stop in time.")
     if _auth_task:
         _auth_task.cancel()
+    # Unsubscribe from event bus
+    for unsub in _bus_unsubs:
+        try:
+            await unsub()
+        except Exception:
+            pass
+    _bus_unsubs = []
     await auth_manager.close()
 
 
