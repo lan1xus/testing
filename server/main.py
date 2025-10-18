@@ -140,7 +140,11 @@ async def on_startup() -> None:
                 try:
                     if snap.get("authenticated") and not bot.online:
                         bot.reload_device_auths()
-                        await bot.ensure_connected()
+                        ok, err = await bot.ensure_connected()
+                        if ok:
+                            await broadcaster.broadcast_json({"type": "chat", "text": "Bot conectado al lobby."})
+                        else:
+                            await broadcaster.broadcast_json({"type": "chat", "text": f"No se pudo conectar al lobby: {err}"})
                 except Exception as e:
                     logger.warning("Failed to auto-connect bot after auth: %s", e)
 

@@ -422,23 +422,24 @@ class Bot:
             return True
         return False
 
-    async def ensure_connected(self) -> None:
+    async def ensure_connected(self) -> tuple[bool, Optional[str]]:
         # Attempt connection via reboot if available and not already connected
         if self.online:
-            return
+            return (True, None)
         if _reboot is None:
-            return
+            return (False, "reboot library not available")
         if not self._device_auth_details:
             # Try reloading from disk (AuthManager may have just written it)
             self.reload_device_auths()
         if not self._device_auth_details:
-            return
+            return (False, "missing device auth")
         ok, _err = await self._connect_via_reboot()
         # Publish status either way
         await self.event_bus.publish("bot.status", self.get_status())
         if ok:
             # Emit a party snapshot after connecting
             await self.event_bus.publish("party.update", self.get_party_status())
+        return (ok, _err)
 
     async def _connect_via_reboot(self) -> tuple[bool, Optional[str]]:
         try:
@@ -455,14 +456,23 @@ class Bot:
                 except TypeError:
                     # Fallback to positional if needed
                     self._reboot_client = client_cls(adv)
-            # Start/connect
+            # Start/connect without blocking the event loop
             start_fn = getattr(self._reboot_client, "start", None) or getattr(self._reboot_client, "run", None)
             if start_fn is None:
                 return (False, "reboot client has no start method")
-            res = start_fn()
-            if asyncio.iscoroutine(res):
-                # Run connect in the background to avoid blocking the server loop
-                asyncio.create_task(res)  # type: ignore[misc]
+            if asyncio.iscoroutinefunction(start_fn):
+                # schedule async start
+                asyncio.create_task(start_fn())  # type: ignore[misc]
+            else:
+                # offload potential blocking start to a thread
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.run_in_executor(None, start_fn)
+                except Exception:
+                    try:
+                        start_fn()
+                    except Exception:
+                        pass
             # Optimistically mark online/ready; underlying client will maintain the session
             self.online = True
             self.ready = True
