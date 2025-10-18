@@ -44,6 +44,7 @@ import asyncio
 import json
 import os
 import logging
+import base64
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -221,8 +222,23 @@ class AuthManager:
             pass
         return out
 
+    def _client_id_from_basic(self, basic_b64: str) -> Optional[str]:
+        try:
+            raw = base64.b64decode((basic_b64 or "").strip()).decode("utf-8", "ignore")
+            client_id = raw.split(":", 1)[0].strip()
+            return client_id or None
+        except Exception:
+            return None
+
     async def _client_credentials_token(self, session: aiohttp.ClientSession, basic_b64: str) -> Optional[str]:
-        headers = {"Authorization": f"Basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+        client_id = self._client_id_from_basic(basic_b64)
+        headers = {
+            "Authorization": f"Basic {basic_b64}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        if client_id:
+            headers["X-Epic-Client-Id"] = client_id
         data = {"grant_type": "client_credentials"}
         async with session.post(TOKEN_ENDPOINT, headers=headers, data=data) as resp:
             try:
@@ -232,23 +248,69 @@ class AuthManager:
         return payload.get("access_token")
 
     async def _request_device_code(self, session: aiohttp.ClientSession, basic_b64: str) -> Dict[str, Any]:
-        headers = {"Authorization": f"Basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+        client_id = self._client_id_from_basic(basic_b64)
+        # Common headers for Epic OAuth endpoints
+        base_headers: Dict[str, str] = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "FortniteBotWebUI/1.0",
+        }
+        if client_id:
+            base_headers["X-Epic-Client-Id"] = client_id
         # Request device code with explicit scopes to ensure a refresh token is granted
         data = {"scope": "basic_profile friends_list presence openid offline_access"}
-        async with session.post(DEVICE_AUTHZ_ENDPOINT, headers=headers, data=data) as resp:
-            payload: Dict[str, Any]
+
+        async def _do(auth_header: str) -> Dict[str, Any]:
+            headers = dict(base_headers)
+            headers["Authorization"] = auth_header
+            async with session.post(DEVICE_AUTHZ_ENDPOINT, headers=headers, data=data) as resp:
+                try:
+                    payload = await resp.json()
+                except Exception:
+                    text = await resp.text()
+                    payload = {"raw": text}
+                try:
+                    payload["_http_status"] = resp.status
+                except Exception:
+                    pass
+            # Normalize Epic error fields (errorCode/message -> error/error_description)
             try:
-                payload = await resp.json()
-            except Exception:
-                text = await resp.text()
-                payload = {"error": f"http_{resp.status}", "raw": text}
-            # Attach HTTP status for diagnostics (non-breaking extra field)
-            try:
-                payload["_http_status"] = resp.status
+                if "error" not in payload and ("errorCode" in payload or "message" in payload or "errorMessage" in payload):
+                    payload["error"] = payload.get("errorCode") or payload.get("errorMessage") or "error"
+                    payload["error_description"] = payload.get("message") or payload.get("errorMessage")
             except Exception:
                 pass
+            return payload
+
+        # Try with Basic first
+        payload = await _do(f"Basic {basic_b64}")
+        if payload.get("device_code") and (payload.get("verification_uri_complete") or payload.get("verification_uri")) and not payload.get("error"):
+            logger.debug(
+                "AuthManager: device code request (Basic) responded with status=%s keys=%s",
+                payload.get("_http_status"),
+                list(payload.keys()),
+            )
+            return payload
+
+        # If we received unauthorized with Basic, fall back to Bearer using client credentials
+        status = int(payload.get("_http_status") or 0)
+        if status in (401, 403) or (payload.get("error") in ("invalid_client", "errors.com.epicgames.account.oauth.invalid_client")):
+            token = await self._client_credentials_token(session, basic_b64)
+            if token:
+                payload2 = await _do(f"Bearer {token}")
+                logger.debug(
+                    "AuthManager: device code request (Bearer fallback) responded with status=%s keys=%s",
+                    payload2.get("_http_status"),
+                    list(payload2.keys()),
+                )
+                return payload2
+
         # Do not log credentials; only log status at debug level
-        logger.debug("AuthManager: device code request responded with status=%s keys=%s", payload.get("_http_status"), list(payload.keys()))
+        logger.debug(
+            "AuthManager: device code request (Basic) responded with status=%s keys=%s",
+            payload.get("_http_status"),
+            list(payload.keys()),
+        )
         return payload
 
     async def start(self) -> Dict[str, Any]:
