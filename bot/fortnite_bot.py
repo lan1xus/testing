@@ -3,7 +3,7 @@ import inspect
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 
 # Command decorator and simple command framework
@@ -42,6 +42,33 @@ class Bot:
         self._started = asyncio.Event()
         self._stopping = asyncio.Event()
 
+        # Runtime state
+        self.online: bool = False
+        self.ready: bool = False
+        self.party: Dict[str, Any] = {
+            "party_id": "local",
+            "leader_id": "bot",
+            "privacy": "private",
+            "playlist": None,
+            "in_match": False,
+            "members": [
+                {"id": "bot", "display_name": "Bot", "leader": True}
+            ],
+        }
+
+        # Optional async status emitter (set by server)
+        self._status_emitter: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None
+
+    def set_status_emitter(self, emitter: Callable[[str, Dict[str, Any]], Awaitable[None]]) -> None:
+        self._status_emitter = emitter
+
+    async def _emit(self, kind: str, payload: Dict[str, Any]) -> None:
+        if self._status_emitter:
+            try:
+                await self._status_emitter(kind, payload)
+            except Exception:
+                self.logger.exception("Status emitter failed")
+
     def add_cog(self, cog: Any) -> None:
         for attr_name in dir(cog):
             maybe = getattr(cog, attr_name)
@@ -67,14 +94,45 @@ class Bot:
             return self._commands.get(self._aliases[name])
         return None
 
+    def list_commands(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for name, cmd in sorted(self._commands.items(), key=lambda kv: kv[0]):
+            out.append({
+                "name": name,
+                "aliases": cmd.aliases,
+                "help": cmd.help,
+                "params": [p.name for p in list(cmd.signature.parameters.values())[1:]],
+            })
+        return out
+
     async def start(self) -> None:
         self.logger.info("Bot starting...")
-        self._started.set()
+        self.online = True
+        self.ready = True
+        await self._emit("bot", {"online": self.online, "ready": self.ready})
         await self._stopping.wait()
+        self.online = False
+        self.ready = False
+        await self._emit("bot", {"online": self.online, "ready": self.ready})
         self.logger.info("Bot stopped.")
 
     async def stop(self) -> None:
         self._stopping.set()
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "online": self.online,
+            "ready": self.ready,
+            "status": "ready" if self.ready else ("online" if self.online else "offline"),
+        }
+
+    def get_party_status(self) -> Dict[str, Any]:
+        # Derive member_count
+        members = self.party.get("members", [])
+        return {
+            **self.party,
+            "member_count": len(members),
+        }
 
     async def dispatch_line(self, line: str, ctx: "WebCtx") -> None:
         line = (line or "").strip()
@@ -226,6 +284,9 @@ class PartyCommands:
     @command(help="Set ready state")
     async def ready(self, ctx: WebCtx) -> None:
         self.bot.logger.info("[Party] Setting ready state to ready")
+        # Track as part of party state for UI
+        self.bot.party["bot_ready"] = True
+        await self.bot._emit("party", self.bot.get_party_status())
         await ctx.send("Ready!")
 
     @command(help="Set party privacy, e.g., !privacy public|friends|private")
@@ -236,12 +297,16 @@ class PartyCommands:
             await ctx.send(f"Invalid privacy mode. Allowed: {', '.join(sorted(allowed))}")
             return
         self.bot.logger.info(f"[Party] Setting privacy: {mode_l}")
+        self.bot.party["privacy"] = mode_l
+        await self.bot._emit("party", self.bot.get_party_status())
         await ctx.send(f"Privacy set to: {mode_l}")
 
     @command(help="Set playlist by ID")
     async def playlist_id(self, ctx: WebCtx, content: str) -> None:
         pid = content.strip()
         self.bot.logger.info(f"[Party] Setting playlist_id: {pid}")
+        self.bot.party["playlist"] = pid
+        await self.bot._emit("party", self.bot.get_party_status())
         await ctx.send(f"Playlist set: {pid}")
 
     @command(help="Stop the bot")

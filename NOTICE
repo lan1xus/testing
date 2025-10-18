@@ -1,0 +1,14 @@
+Third-Party License Notice
+
+This repository includes an Epic Device Authentication helper (server/auth.py)
+that conceptually mirrors the logic and flow of device-auth generation commonly
+used in the Fortnite community. To respect ecosystem licensing norms, the
+module includes a Commons Clause + Apache 2.0 Modified license header, which is
+commonly used by similar tools.
+
+The rest of the repository is licensed under the MIT License (see LICENSE).
+
+No proprietary code has been copied into this repository. The device auth
+implementation is an independent reimplementation of the documented OAuth 2.0
+device code flow offered by Epic Games, and interacts with Epic's public OAuth
+endpoints at runtime.

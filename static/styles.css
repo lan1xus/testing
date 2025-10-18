@@ -19,11 +19,49 @@ header h1 {
   margin: 0 0 4px 0;
   font-size: 18px;
 }
+#status-bar {
+  margin-top: 8px;
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.status-card {
+  background: #161a23;
+  border: 1px solid #2a3344;
+  padding: 8px 10px;
+  border-radius: 8px;
+  min-width: 160px;
+}
+.status-title {
+  font-size: 12px;
+  opacity: 0.8;
+}
+.status-value {
+  font-weight: 600;
+}
 main {
   flex: 1;
   overflow: auto;
   padding: 16px;
 }
+#panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.panel {
+  background: #141822;
+  border: 1px solid #2a3344;
+  border-radius: 8px;
+  padding: 12px;
+}
+.panel h2 {
+  margin: 0 0 8px 0;
+  font-size: 16px;
+}
+.small { font-size: 12px; opacity: 0.85; }
+
 #messages {
   display: flex;
   flex-direction: column;
