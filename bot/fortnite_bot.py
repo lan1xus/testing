@@ -1,12 +1,23 @@
 import asyncio
 import inspect
+import json
 import logging
-import os
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+
+from .event_bus import EventBus
+
+# Optional rebootpy import (no side effects on import)
+try:  # pragma: no cover - optional dependency at runtime
+    import reboot as _reboot  # type: ignore
+except Exception:  # pragma: no cover - library might not be installed in CI
+    _reboot = None  # type: ignore
 
 
-# Command decorator and simple command framework
+# -----------------------------
+# Lightweight commands framework
+# -----------------------------
 
 def command(name: Optional[str] = None, aliases: Optional[Sequence[str]] = None, help: Optional[str] = None):
     def decorator(func: Callable[..., Awaitable[Any]]):
@@ -28,23 +39,174 @@ class Command:
     help: str
 
 
-class Bot:
-    def __init__(self, command_prefix: str = "!") -> None:
-        self.logger = logging.getLogger("fortnite_web_bot")
-        self.logger.setLevel(logging.INFO)
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
-        self.logger.addHandler(handler)
+# -----------------------------
+# Config and helpers
+# -----------------------------
 
-        self.command_prefix = command_prefix
+@dataclass
+class BotConfig:
+    command_prefix: str = "!"
+    device_auths_path: Optional[Path] = None
+    account_id: Optional[str] = None  # pick a specific account_id from device_auths.json
+    log_level: int = logging.INFO
+
+
+def load_device_auths(path: Path) -> Dict[str, Dict[str, str]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = json.loads(text) if text else {}
+        # Normalize into {account_id: {device_id, account_id, secret}}
+        if isinstance(data, dict) and "accounts" in data and isinstance(data["accounts"], list):
+            # Shape from server/auth.py persistence: [{deviceId, accountId, secret, display_name, email}, ...]
+            out: Dict[str, Dict[str, str]] = {}
+            for item in data.get("accounts", []):
+                a_id = item.get("account_id") or item.get("accountId")
+                if not a_id:
+                    continue
+                out[a_id] = {
+                    "device_id": item.get("device_id") or item.get("deviceId"),
+                    "account_id": a_id,
+                    "secret": item.get("secret"),
+                }
+            return out
+        elif isinstance(data, dict):
+            # Shape from AuthManager persistence: {key(email|accountId): {accountId, deviceId, secret, ...}}
+            out2: Dict[str, Dict[str, str]] = {}
+            for _k, _v in data.items():
+                if not isinstance(_v, dict):
+                    continue
+                a_id = _v.get("account_id") or _v.get("accountId") or str(_k)
+                d_id = _v.get("device_id") or _v.get("deviceId")
+                secret = _v.get("secret")
+                if not a_id or not d_id or not secret:
+                    continue
+                out2[a_id] = {"device_id": d_id, "account_id": a_id, "secret": secret}
+            return out2
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+    return {}
+
+
+def select_device_auth(device_auths: Dict[str, Dict[str, str]], account_id: Optional[str] = None) -> Optional[Dict[str, str]]:
+    if not device_auths:
+        return None
+    if account_id and account_id in device_auths:
+        return device_auths[account_id]
+    # Fallback: return the first entry
+    try:
+        return next(iter(device_auths.values()))
+    except StopIteration:
+        return None
+
+
+# -----------------------------
+# Web context used by commands
+# -----------------------------
+
+class WebCtx:
+    def __init__(self, send_func: Callable[[str], Awaitable[None]], author: Optional[Dict[str, str]] = None, bot: Optional["Bot"] = None) -> None:
+        self._send_func = send_func
+        self.author = author or {"id": "web", "display_name": "WebUser"}
+        self.bot = bot
+
+    async def send(self, text: str) -> None:
+        await self._send_func(text)
+
+
+# -----------------------------
+# Example cogs mirroring cosmetics/party commands
+# -----------------------------
+
+class CosmeticCommands:
+    def __init__(self, bot: "Bot") -> None:
+        self.bot = bot
+
+    @command(help="Say hello to check connectivity")
+    async def hello(self, ctx: WebCtx) -> None:
+        await ctx.send("Hello! The bot is online.")
+
+    @command(help="Change skin (cosmetic)")
+    async def skin(self, ctx: WebCtx, content: str) -> None:
+        self.bot.logger.info(f"[Cosmetic] Setting skin to: {content}")
+        await ctx.send(f"Skin set to: {content}")
+
+    @command(help="Play an emote")
+    async def emote(self, ctx: WebCtx, content: str) -> None:
+        self.bot.logger.info(f"[Cosmetic] Playing emote: {content}")
+        await ctx.send(f"Emote: {content}")
+
+    @command(help="Equip pickaxe")
+    async def pickaxe(self, ctx: WebCtx, content: str) -> None:
+        self.bot.logger.info(f"[Cosmetic] Equipping pickaxe: {content}")
+        await ctx.send(f"Pickaxe: {content}")
+
+
+class PartyCommands:
+    def __init__(self, bot: "Bot") -> None:
+        self.bot = bot
+
+    @command(help="Set ready state")
+    async def ready(self, ctx: WebCtx) -> None:
+        self.bot.logger.info("[Party] Setting ready state to ready")
+        self.bot.party["bot_ready"] = True
+        await self.bot.event_bus.publish("party.update", self.bot.get_party_status())
+        await ctx.send("Ready!")
+
+    @command(help="Set party privacy, e.g., !privacy public|friends|private")
+    async def privacy(self, ctx: WebCtx, mode: str) -> None:
+        mode_l = (mode or "").lower().strip()
+        allowed = {"public", "friends", "private"}
+        if mode_l not in allowed:
+            await ctx.send(f"Invalid privacy mode. Allowed: {', '.join(sorted(allowed))}")
+            return
+        self.bot.logger.info(f"[Party] Setting privacy: {mode_l}")
+        self.bot.party["privacy"] = mode_l
+        await self.bot.event_bus.publish("party.update", self.bot.get_party_status())
+        await ctx.send(f"Privacy set to: {mode_l}")
+
+    @command(help="Set playlist by ID")
+    async def playlist_id(self, ctx: WebCtx, content: str) -> None:
+        pid = content.strip()
+        self.bot.logger.info(f"[Party] Setting playlist_id: {pid}")
+        self.bot.party["playlist"] = pid
+        await self.bot.event_bus.publish("party.update", self.bot.get_party_status())
+        await ctx.send(f"Playlist set: {pid}")
+
+    @command(help="Stop the bot")
+    async def stop(self, ctx: WebCtx) -> None:
+        await ctx.send("Stopping bot...")
+        await self.bot.stop()
+
+
+# -----------------------------
+# Core Bot wrapper with EventBus
+# -----------------------------
+
+class Bot:
+    def __init__(self, *, config: BotConfig) -> None:
+        self.logger = logging.getLogger("fortnite_web_bot")
+        self.logger.setLevel(config.log_level)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
+            self.logger.addHandler(handler)
+
+        self.config = config
+        self.event_bus = EventBus()
+
+        # Command framework state
+        self.command_prefix = config.command_prefix
         self._commands: Dict[str, Command] = {}
         self._aliases: Dict[str, str] = {}
-        self._started = asyncio.Event()
-        self._stopping = asyncio.Event()
 
-        # Runtime state
+        # Lifecycle state
+        self._stopping = asyncio.Event()
         self.online: bool = False
         self.ready: bool = False
+
+        # Party snapshot
         self.party: Dict[str, Any] = {
             "party_id": "local",
             "leader_id": "bot",
@@ -56,19 +218,30 @@ class Bot:
             ],
         }
 
-        # Optional async status emitter (set by server)
-        self._status_emitter: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None
+        # rebootpy runtime fields
+        self._reboot_client: Any = None
+        self._device_auth_details: Optional[Dict[str, str]] = None
 
+        # Preload device auth details if available
+        if self.config.device_auths_path:
+            auths = load_device_auths(self.config.device_auths_path)
+            self._device_auth_details = select_device_auth(auths, self.config.account_id)
+
+    # Back-compat for older servers: allow attaching a status emitter that mirrors event bus publications
     def set_status_emitter(self, emitter: Callable[[str, Dict[str, Any]], Awaitable[None]]) -> None:
-        self._status_emitter = emitter
-
-    async def _emit(self, kind: str, payload: Dict[str, Any]) -> None:
-        if self._status_emitter:
+        async def _relay(topic: str, payload: Dict[str, Any]) -> None:
+            # Map topic -> kind (top-level key used previously)
+            kind = "bot" if topic == "bot.status" else ("party" if topic.startswith("party.") else topic)
             try:
-                await self._status_emitter(kind, payload)
+                await emitter(kind, payload)
             except Exception:
-                self.logger.exception("Status emitter failed")
+                pass
 
+        # Fire-and-forget subscription (no handle stored; used transiently during app lifetime)
+        asyncio.create_task(self.event_bus.subscribe("bot.status", _relay))
+        asyncio.create_task(self.event_bus.subscribe("party.update", _relay))
+
+    # ---- Commands API ----
     def add_cog(self, cog: Any) -> None:
         for attr_name in dir(cog):
             maybe = getattr(cog, attr_name)
@@ -76,16 +249,12 @@ class Bot:
                 name = getattr(maybe, "_command_name")
                 aliases: List[str] = list(getattr(maybe, "_command_aliases", []))
                 help_text: str = getattr(maybe, "_command_help", "")
-                # Bind the method to the cog (in case it's a function on the class)
                 callback = getattr(cog, attr_name)
                 sig = inspect.signature(callback)
                 cmd = Command(name=name, callback=callback, cog=cog, signature=sig, aliases=aliases, help=help_text)
-                if name in self._commands:
-                    self.logger.warning(f"Command {name} is already registered; overriding.")
                 self._commands[name] = cmd
                 for al in aliases:
                     self._aliases[al] = name
-                self.logger.debug(f"Registered command: {name} (aliases: {aliases})")
 
     def get_command(self, name: str) -> Optional[Command]:
         if name in self._commands:
@@ -105,36 +274,7 @@ class Bot:
             })
         return out
 
-    async def start(self) -> None:
-        self.logger.info("Bot starting...")
-        self.online = True
-        self.ready = True
-        await self._emit("bot", {"online": self.online, "ready": self.ready})
-        await self._stopping.wait()
-        self.online = False
-        self.ready = False
-        await self._emit("bot", {"online": self.online, "ready": self.ready})
-        self.logger.info("Bot stopped.")
-
-    async def stop(self) -> None:
-        self._stopping.set()
-
-    def get_status(self) -> Dict[str, Any]:
-        return {
-            "online": self.online,
-            "ready": self.ready,
-            "status": "ready" if self.ready else ("online" if self.online else "offline"),
-        }
-
-    def get_party_status(self) -> Dict[str, Any]:
-        # Derive member_count
-        members = self.party.get("members", [])
-        return {
-            **self.party,
-            "member_count": len(members),
-        }
-
-    async def dispatch_line(self, line: str, ctx: "WebCtx") -> None:
+    async def dispatch_line(self, line: str, ctx: WebCtx) -> None:
         line = (line or "").strip()
         if not line:
             return
@@ -159,35 +299,29 @@ class Bot:
             return
         try:
             await cmd.callback(ctx, *args)
-        except Exception as e:
+        except Exception as e:  # pragma: no cover - defensive
             self.logger.exception("Command execution error")
             await ctx.send(f"An error occurred while executing '{name}': {e}")
 
     def _parse_args(self, cmd: Command, arg_str: str) -> List[Any]:
         sig = cmd.signature
         params = list(sig.parameters.values())
-        # Expect first parameter to be ctx; skip that one
         if not params:
             return []
-        if params[0].name != "ctx":
-            # Allow methods that may still include ctx but under a different name
-            pass
+        # Skip ctx
         params = params[1:]
 
-        # If there are no further parameters
         if not params:
             if arg_str.strip():
                 raise ValueError("This command takes no arguments.")
             return []
 
-        # Catch-all string if a single string parameter or a parameter named 'content'
         if len(params) == 1:
             p = params[0]
             ann = p.annotation
             if ann is inspect._empty or ann is str or p.name == "content":
                 return [arg_str]
 
-        # Otherwise split by whitespace and coerce per param types
         tokens = arg_str.split() if arg_str else []
         args: List[Any] = []
         idx = 0
@@ -202,7 +336,6 @@ class Bot:
                     raise ValueError(f"Missing required argument: {p.name}")
             raw = tokens[idx]
             idx += 1
-            # Coercion
             if ann in (inspect._empty, str):
                 val = raw
             elif ann is int:
@@ -224,106 +357,91 @@ class Bot:
                 else:
                     raise ValueError(f"Argument '{p.name}' must be a boolean (true/false).")
             else:
-                # Fallback to string
                 val = raw
             args.append(val)
 
-        # If there are extra tokens, append them to the last string parameter as a tail if possible
+        # Glue remaining tokens to last string arg if present
         if idx < len(tokens):
-            # Check if last param is str
             last = params[-1]
             if last.annotation in (inspect._empty, str):
                 remaining = tokens[idx:]
                 args[-1] = f"{args[-1]} {' '.join(remaining)}".strip()
-            else:
-                # Ignore extras silently
-                pass
         return args
 
+    # ---- Lifecycle ----
+    async def start(self) -> None:
+        self.logger.info("Bot starting...")
+        # If rebootpy is available and we have device auth, prepare client (no side effects beyond local state)
+        if _reboot is not None and self._device_auth_details:
+            try:
+                # Resolve AdvancedAuth class dynamically
+                advanced_auth_cls = getattr(_reboot, "AdvancedAuth", None) or getattr(getattr(_reboot, "auth", object), "AdvancedAuth", None)
+                client_cls = getattr(_reboot, "Client", None)
+                adv_auth = advanced_auth_cls(device_auth_details=self._device_auth_details) if advanced_auth_cls else None
+                if client_cls and adv_auth:
+                    # We intentionally do not connect to Epic services here to keep import/startup side-effect free for tests.
+                    # Store a configured client instance for future extension.
+                    self._reboot_client = client_cls(auth=adv_auth)
+            except Exception:
+                # Fallback to local-only behavior if rebootpy is not usable
+                self._reboot_client = None
+        self.online = True
+        self.ready = True
+        await self.event_bus.publish("bot.status", self.get_status())
+        await self._stopping.wait()
+        self.online = False
+        self.ready = False
+        await self.event_bus.publish("bot.status", self.get_status())
+        self.logger.info("Bot stopped.")
 
-# Minimal WebCtx to be used by the server and commands
-class WebCtx:
-    def __init__(self, send_func: Callable[[str], Awaitable[None]], author: Optional[Dict[str, str]] = None, bot: Optional[Bot] = None) -> None:
-        self._send_func = send_func
-        self.author = author or {"id": "web", "display_name": "WebUser"}
-        self.bot = bot
+    async def stop(self) -> None:
+        self._stopping.set()
 
-    async def send(self, text: str) -> None:
-        await self._send_func(text)
+    # ---- Snapshots ----
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "online": self.online,
+            "ready": self.ready,
+            "status": "ready" if self.ready else ("online" if self.online else "offline"),
+        }
 
-
-# Example cogs mimicking the Fortnite bot's cosmetics/party commands
-class CosmeticCommands:
-    def __init__(self, bot: Bot) -> None:
-        self.bot = bot
-
-    @command(help="Say hello to check connectivity")
-    async def hello(self, ctx: WebCtx) -> None:
-        await ctx.send("Hello! The bot is online.")
-
-    @command(help="Change skin (cosmetic)")
-    async def skin(self, ctx: WebCtx, content: str) -> None:
-        self.bot.logger.info(f"[Cosmetic] Setting skin to: {content}")
-        await ctx.send(f"Skin set to: {content}")
-
-    @command(help="Play an emote")
-    async def emote(self, ctx: WebCtx, content: str) -> None:
-        self.bot.logger.info(f"[Cosmetic] Playing emote: {content}")
-        await ctx.send(f"Emote: {content}")
-
-    @command(help="Equip pickaxe")
-    async def pickaxe(self, ctx: WebCtx, content: str) -> None:
-        self.bot.logger.info(f"[Cosmetic] Equipping pickaxe: {content}")
-        await ctx.send(f"Pickaxe: {content}")
-
-
-class PartyCommands:
-    def __init__(self, bot: Bot) -> None:
-        self.bot = bot
-
-    @command(help="Set ready state")
-    async def ready(self, ctx: WebCtx) -> None:
-        self.bot.logger.info("[Party] Setting ready state to ready")
-        # Track as part of party state for UI
-        self.bot.party["bot_ready"] = True
-        await self.bot._emit("party", self.bot.get_party_status())
-        await ctx.send("Ready!")
-
-    @command(help="Set party privacy, e.g., !privacy public|friends|private")
-    async def privacy(self, ctx: WebCtx, mode: str) -> None:
-        mode_l = mode.lower().strip()
-        allowed = {"public", "friends", "private"}
-        if mode_l not in allowed:
-            await ctx.send(f"Invalid privacy mode. Allowed: {', '.join(sorted(allowed))}")
-            return
-        self.bot.logger.info(f"[Party] Setting privacy: {mode_l}")
-        self.bot.party["privacy"] = mode_l
-        await self.bot._emit("party", self.bot.get_party_status())
-        await ctx.send(f"Privacy set to: {mode_l}")
-
-    @command(help="Set playlist by ID")
-    async def playlist_id(self, ctx: WebCtx, content: str) -> None:
-        pid = content.strip()
-        self.bot.logger.info(f"[Party] Setting playlist_id: {pid}")
-        self.bot.party["playlist"] = pid
-        await self.bot._emit("party", self.bot.get_party_status())
-        await ctx.send(f"Playlist set: {pid}")
-
-    @command(help="Stop the bot")
-    async def stop(self, ctx: WebCtx) -> None:
-        await ctx.send("Stopping bot...")
-        await self.bot.stop()
+    def get_party_status(self) -> Dict[str, Any]:
+        members = self.party.get("members", [])
+        return {
+            **self.party,
+            "member_count": len(members),
+        }
 
 
-def create_bot() -> Bot:
-    prefix = os.environ.get("COMMAND_PREFIX", "!")
-    bot = Bot(command_prefix=prefix)
+# -----------------------------
+# Factory/entry points
+# -----------------------------
+
+def create_bot(config: Optional[BotConfig] = None) -> Bot:
+    if config is None:
+        config = BotConfig()
+    bot = Bot(config=config)
+    # Install cogs via our lightweight extension loader
     bot.add_cog(CosmeticCommands(bot))
     bot.add_cog(PartyCommands(bot))
     return bot
 
 
-async def start_bot(bot: Optional[Bot] = None) -> None:
+async def start_bot(bot: Optional[Bot] = None, *, config: Optional[BotConfig] = None) -> None:
     if bot is None:
-        bot = create_bot()
+        if config is None:
+            config = BotConfig()
+        bot = create_bot(config)
     await bot.start()
+
+
+# -----------------------------
+# Public helpers for server/state manager
+# -----------------------------
+
+def party_snapshot(bot: Bot) -> Dict[str, Any]:
+    return bot.get_party_status()
+
+
+def status_summary(bot: Bot) -> Dict[str, Any]:
+    return bot.get_status()
