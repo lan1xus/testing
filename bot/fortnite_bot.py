@@ -174,6 +174,18 @@ class PartyCommands:
         await self.bot.event_bus.publish("party.update", self.bot.get_party_status())
         await ctx.send(f"Playlist set: {pid}")
 
+    @command(help="Invite a user to your party by display name. Usage: !invite <username>")
+    async def invite(self, ctx: WebCtx, username: str) -> None:
+        name = (username or "").strip()
+        if not name:
+            await ctx.send("Usage: !invite <username>")
+            return
+        ok, err = await self.bot.invite_user(name)
+        if ok:
+            await ctx.send(f"Invited: {name}")
+        else:
+            await ctx.send(f"Failed to invite {name}: {err or 'not connected'}")
+
     @command(help="Stop the bot")
     async def stop(self, ctx: WebCtx) -> None:
         await ctx.send("Stopping bot...")
@@ -371,24 +383,26 @@ class Bot:
     # ---- Lifecycle ----
     async def start(self) -> None:
         self.logger.info("Bot starting...")
-        # If rebootpy is available and we have device auth, prepare client (no side effects beyond local state)
-        if _reboot is not None and self._device_auth_details:
-            try:
-                # Resolve AdvancedAuth class dynamically
-                advanced_auth_cls = getattr(_reboot, "AdvancedAuth", None) or getattr(getattr(_reboot, "auth", object), "AdvancedAuth", None)
-                client_cls = getattr(_reboot, "Client", None)
-                adv_auth = advanced_auth_cls(device_auth_details=self._device_auth_details) if advanced_auth_cls else None
-                if client_cls and adv_auth:
-                    # We intentionally do not connect to Epic services here to keep import/startup side-effect free for tests.
-                    # Store a configured client instance for future extension.
-                    self._reboot_client = client_cls(auth=adv_auth)
-            except Exception:
-                # Fallback to local-only behavior if rebootpy is not usable
-                self._reboot_client = None
-        self.online = True
-        self.ready = True
+        # Try to connect immediately if we already have device auth
+        try:
+            await self.ensure_connected()
+        except Exception:
+            # stay offline; will try again when device auth appears
+            pass
+        # Emit initial status
         await self.event_bus.publish("bot.status", self.get_status())
+        # Wait until stop is requested
         await self._stopping.wait()
+        # Attempt a graceful shutdown of underlying client
+        try:
+            if self._reboot_client is not None:
+                stop_fn = getattr(self._reboot_client, "close", None) or getattr(self._reboot_client, "stop", None)
+                if stop_fn:
+                    res = stop_fn()
+                    if asyncio.iscoroutine(res):
+                        await res  # type: ignore[misc]
+        except Exception:
+            pass
         self.online = False
         self.ready = False
         await self.event_bus.publish("bot.status", self.get_status())
@@ -396,6 +410,149 @@ class Bot:
 
     async def stop(self) -> None:
         self._stopping.set()
+
+    # ---- Connectivity helpers ----
+    def reload_device_auths(self) -> bool:
+        if not self.config.device_auths_path:
+            return False
+        auths = load_device_auths(self.config.device_auths_path)
+        details = select_device_auth(auths, self.config.account_id)
+        if details and details != self._device_auth_details:
+            self._device_auth_details = details
+            return True
+        return False
+
+    async def ensure_connected(self) -> None:
+        # Attempt connection via reboot if available and not already connected
+        if self.online:
+            return
+        if _reboot is None:
+            return
+        if not self._device_auth_details:
+            # Try reloading from disk (AuthManager may have just written it)
+            self.reload_device_auths()
+        if not self._device_auth_details:
+            return
+        ok, _err = await self._connect_via_reboot()
+        # Publish status either way
+        await self.event_bus.publish("bot.status", self.get_status())
+        if ok:
+            # Emit a party snapshot after connecting
+            await self.event_bus.publish("party.update", self.get_party_status())
+
+    async def _connect_via_reboot(self) -> tuple[bool, Optional[str]]:
+        try:
+            # Build client if needed
+            if self._reboot_client is None:
+                advanced_auth_cls = getattr(_reboot, "AdvancedAuth", None) or getattr(getattr(_reboot, "auth", object), "AdvancedAuth", None)
+                client_cls = getattr(_reboot, "Client", None)
+                if not advanced_auth_cls or not client_cls:
+                    return (False, "reboot library missing components")
+                adv = advanced_auth_cls(device_auth_details=self._device_auth_details)
+                # Try passing minimal args; library-specific kwargs are optional
+                try:
+                    self._reboot_client = client_cls(auth=adv)
+                except TypeError:
+                    # Fallback to positional if needed
+                    self._reboot_client = client_cls(adv)
+            # Start/connect
+            start_fn = getattr(self._reboot_client, "start", None) or getattr(self._reboot_client, "run", None)
+            if start_fn is None:
+                return (False, "reboot client has no start method")
+            res = start_fn()
+            if asyncio.iscoroutine(res):
+                # Run connect in the background to avoid blocking the server loop
+                asyncio.create_task(res)  # type: ignore[misc]
+            # Optimistically mark online/ready; underlying client will maintain the session
+            self.online = True
+            self.ready = True
+            # Try to get party info from client if available
+            try:
+                party_obj = getattr(self._reboot_client, "party", None)
+                if party_obj is not None:
+                    # Best-effort extraction
+                    party_id = getattr(party_obj, "id", None) or getattr(party_obj, "party_id", None) or self.party.get("party_id")
+                    members_list: List[Dict[str, Any]] = []
+                    members_attr = getattr(party_obj, "members", None)
+                    if isinstance(members_attr, (list, tuple)):
+                        for m in list(members_attr):
+                            try:
+                                m_id = getattr(m, "id", None) or getattr(m, "user_id", None) or getattr(m, "account_id", None)
+                                dn = getattr(m, "display_name", None) or getattr(m, "displayName", None) or getattr(getattr(m, "user", None), "display_name", None)
+                                is_leader = bool(getattr(m, "leader", False) or getattr(m, "is_leader", False))
+                                members_list.append({"id": str(m_id or ""), "display_name": str(dn or m_id or ""), "leader": is_leader})
+                            except Exception:
+                                continue
+                    if party_id:
+                        self.party["party_id"] = str(party_id)
+                    if members_list:
+                        self.party["members"] = members_list
+            except Exception:
+                pass
+            return (True, None)
+        except Exception as e:
+            self.logger.warning("Failed to connect via reboot: %s", e)
+            self.online = False
+            self.ready = False
+            return (False, str(e))
+
+    async def invite_user(self, display_name: str) -> tuple[bool, Optional[str]]:
+        name = (display_name or "").strip()
+        if not name:
+            return (False, "missing username")
+        if not self._reboot_client or not self.online:
+            # Simulate in local-only mode
+            self.logger.info("[Party] (local) Inviting user: %s", name)
+            return (True, None)
+        try:
+            client = self._reboot_client
+            # Try a few common APIs to resolve a user then invite
+            user_obj = None
+            # 1) fetch_user_by_display_name
+            fn = getattr(client, "fetch_user_by_display_name", None)
+            if callable(fn):
+                res = fn(name)
+                user_obj = await res if asyncio.iscoroutine(res) else res
+            # 2) search_users
+            if user_obj is None:
+                fn2 = getattr(client, "search_users", None)
+                if callable(fn2):
+                    res2 = fn2(name)
+                    items = await res2 if asyncio.iscoroutine(res2) else res2
+                    try:
+                        user_obj = (items[0] if isinstance(items, (list, tuple)) and items else None)
+                    except Exception:
+                        user_obj = None
+            # 3) fetch_user
+            if user_obj is None:
+                fn3 = getattr(client, "fetch_user", None)
+                if callable(fn3):
+                    res3 = fn3(name)
+                    user_obj = await res3 if asyncio.iscoroutine(res3) else res3
+            # Determine an ID to invite
+            target_id = None
+            if user_obj is not None:
+                target_id = getattr(user_obj, "id", None) or getattr(user_obj, "account_id", None) or getattr(user_obj, "user_id", None)
+            # Send invite via party API
+            party = getattr(client, "party", None)
+            invite_fn = getattr(party, "invite", None) if party else None
+            if invite_fn and target_id:
+                res = invite_fn(target_id)
+                if asyncio.iscoroutine(res):
+                    await res  # type: ignore[misc]
+                self.logger.info("[Party] Invited user '%s' (%s)", name, target_id)
+                return (True, None)
+            # Some implementations can invite by display name directly
+            if invite_fn and not target_id:
+                res = invite_fn(name)
+                if asyncio.iscoroutine(res):
+                    await res  # type: ignore[misc]
+                self.logger.info("[Party] Invited user by name '%s'", name)
+                return (True, None)
+            return (False, "invite API not available")
+        except Exception as e:
+            self.logger.warning("Failed to invite '%s': %s", name, e)
+            return (False, str(e))
 
     # ---- Snapshots ----
     def get_status(self) -> Dict[str, Any]:

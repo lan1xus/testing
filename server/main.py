@@ -135,6 +135,14 @@ async def on_startup() -> None:
                 last_snapshot = snap
                 state["auth"] = snap
                 await broadcaster.broadcast_json({"type": "status", "data": {"auth": snap}})
+                # If authentication just completed and the bot is not connected yet,
+                # refresh device auths from disk and attempt to connect.
+                try:
+                    if snap.get("authenticated") and not bot.online:
+                        bot.reload_device_auths()
+                        await bot.ensure_connected()
+                except Exception as e:
+                    logger.warning("Failed to auto-connect bot after auth: %s", e)
 
     _auth_task = asyncio.create_task(auth_watchdog())
 
