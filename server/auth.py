@@ -43,12 +43,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
+
+# Logger setup for auth flow
+logger = logging.getLogger("fortnite_auth")
+logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
+if not logger.handlers:
+    logger.addHandler(_handler)
 
 
 # Endpoints and constants for Epic OAuth
@@ -169,6 +178,9 @@ class AuthManager:
             "user": asdict(s.user) if s.user else None,
             "verification_uri_complete": self._verification_uri_complete if s.pending else None,
             "last_event": s.last_event,
+            "platform": self._used_platform,
+            "poll_interval": self._poll_interval_seconds,
+            "expires_at": (datetime.fromtimestamp(self._device_code_expires_at, tz=timezone.utc).isoformat() if self._device_code_expires_at else None),
         }
 
     async def logout(self) -> None:
@@ -182,6 +194,7 @@ class AuthManager:
             self._used_platform = None
             self._device_code_expires_at = None
             self._poll_interval_seconds = 2.0
+        logger.info("AuthManager: logout completed; state cleared.")
 
     def _resolve_basic_candidates(self) -> List[Tuple[str, str]]:
         """Return a list of (PLATFORM, basic_b64) candidates to try in order."""
@@ -201,6 +214,11 @@ class AuthManager:
         elif DEFAULT_ANDROID_BASIC_B64:
             out.append(("ANDROID", DEFAULT_ANDROID_BASIC_B64))
 
+        # Log which platforms will be attempted (do not log credentials)
+        try:
+            logger.info("AuthManager: resolved Basic candidates: %s", [p for p, _ in out])
+        except Exception:
+            pass
         return out
 
     async def _client_credentials_token(self, session: aiohttp.ClientSession, basic_b64: str) -> Optional[str]:
@@ -222,7 +240,15 @@ class AuthManager:
             try:
                 payload = await resp.json()
             except Exception:
-                payload = {"error": f"http_{resp.status}", "raw": await resp.text()}
+                text = await resp.text()
+                payload = {"error": f"http_{resp.status}", "raw": text}
+            # Attach HTTP status for diagnostics (non-breaking extra field)
+            try:
+                payload["_http_status"] = resp.status
+            except Exception:
+                pass
+        # Do not log credentials; only log status at debug level
+        logger.debug("AuthManager: device code request responded with status=%s keys=%s", payload.get("_http_status"), list(payload.keys()))
         return payload
 
     async def start(self) -> Dict[str, Any]:
@@ -247,6 +273,7 @@ class AuthManager:
                 self._status.last_event = "start_failed"
             return {"error": self._status.error}
 
+        logger.info("AuthManager: starting device code flow; candidates=%s", [p for p, _ in candidates])
         device_code: Optional[str] = None
         verification_uri_complete: Optional[str] = None
         used_basic: Optional[str] = None
@@ -255,6 +282,7 @@ class AuthManager:
         interval: Optional[int] = None
 
         for platform, basic_b64 in candidates:
+            logger.info("AuthManager: requesting device code via platform=%s", platform)
             payload = await self._request_device_code(session, basic_b64)
             device_code = payload.get("device_code")
             verification_uri_complete = payload.get("verification_uri_complete") or payload.get("verification_uri")
@@ -264,18 +292,34 @@ class AuthManager:
                 used_platform = platform
                 expires_in = payload.get("expires_in")
                 interval = payload.get("interval")
+                logger.info("AuthManager: acquired device code on %s; expires_in=%s interval=%s", platform, expires_in, interval)
                 break
             # If authorization server says invalid_client, fall through and try next
             # Record the last error in status for visibility
             async with self._lock:
                 self._status.error = payload.get("error_description") or payload.get("error") or "device_code_error"
                 self._status.last_event = f"device_code_error_{platform.lower()}"
+            # Log failure details without secrets
+            try:
+                logger.warning(
+                    "AuthManager: device code request failed for platform=%s status=%s error=%s desc=%s",
+                    platform,
+                    payload.get("_http_status"),
+                    payload.get("error"),
+                    payload.get("error_description"),
+                )
+                raw = payload.get("raw")
+                if raw:
+                    logger.debug("AuthManager: raw response (%s) for %s: %s", payload.get("_http_status"), platform, str(raw)[:500])
+            except Exception:
+                pass
         
         if not device_code or not verification_uri_complete or not used_basic or not used_platform:
             async with self._lock:
                 self._status.pending = False
                 if not self._status.error:
                     self._status.error = "Device code response incomplete"
+            logger.error("AuthManager: failed to acquire device code; last_error=%s", self._status.error)
             return {"error": self._status.error}
 
         async with self._lock:
@@ -295,6 +339,11 @@ class AuthManager:
             else:
                 # keep at least 2 seconds between polls by default
                 self._poll_interval_seconds = max(self._poll_interval_seconds, 2.0)
+        try:
+            exp_str = (datetime.fromtimestamp(self._device_code_expires_at, tz=timezone.utc).isoformat() if self._device_code_expires_at else "unknown")
+            logger.info("AuthManager: device code set; platform=%s poll_interval=%.1fs expires_at=%s", used_platform, self._poll_interval_seconds, exp_str)
+        except Exception:
+            pass
 
         # Fire-and-forget poller
         asyncio.create_task(self._poll_for_completion(used_basic))
@@ -330,12 +379,14 @@ class AuthManager:
             if error == "authorization_pending":
                 async with self._lock:
                     self._status.last_event = "authorization_pending"
+                logger.debug("AuthManager: authorization pending; waiting for user approval...")
                 continue
             if error == "slow_down":
                 async with self._lock:
                     self._status.last_event = "slow_down"
                     # Increase polling interval modestly up to a ceiling
                     self._poll_interval_seconds = min((self._poll_interval_seconds or poll_delay) + 1.0, 10.0)
+                logger.info("AuthManager: received slow_down; new poll_interval=%.1fs", self._poll_interval_seconds)
                 continue
             if error in ("invalid_grant", "invalid_request"):
                 # Treat as pending until code expires; some backends transiently respond with invalid_grant
@@ -343,6 +394,7 @@ class AuthManager:
                 if expires_at is None or now_ts < expires_at:
                     async with self._lock:
                         self._status.last_event = "invalid_grant_pending"
+                    logger.debug("AuthManager: received invalid_grant but device code not expired; continuing to poll")
                     continue
                 async with self._lock:
                     self._status.error = "Device code expired"
@@ -356,6 +408,7 @@ class AuthManager:
                     self._status.pending = False
                     self._pending_device_code = None
                     self._status.last_event = "device_flow_failed"
+                logger.warning("AuthManager: device flow failed: %s", error)
                 return
 
             # Success: capture access/refresh tokens
@@ -369,8 +422,10 @@ class AuthManager:
                     self._status.pending = False
                     self._pending_device_code = None
                     self._status.last_event = "token_payload_invalid"
+                logger.warning("AuthManager: token payload missing fields; keys=%s", list(token_payload.keys()))
                 return
 
+            logger.info("AuthManager: access token acquired; account_id=%s", account_id)
             # If we started with SWITCH, exchange to ANDROID client for device-auth creation
             if (self._used_platform or "").upper() != "ANDROID":
                 # Find ANDROID basic credential
@@ -400,8 +455,10 @@ class AuthManager:
                                 async with self._lock:
                                     self._used_platform = "ANDROID"
                                     self._status.last_event = "exchanged_to_android"
+                                logger.info("AuthManager: exchanged token to ANDROID client for device-auth creation")
                 except Exception:
                     # If anything fails during exchange, continue with current token
+                    logger.debug("AuthManager: exchange to ANDROID failed; continuing with current token")
                     pass
 
             # Fetch user details (email/display name) if possible using the final token
@@ -411,7 +468,7 @@ class AuthManager:
                 email = details.get("email")
                 display_name = display_name or details.get("displayName") or details.get("display_name")
             except Exception:
-                pass
+                logger.debug("AuthManager: failed to fetch user details; continuing without email/display name")
 
             async with self._lock:
                 self._access_token = access_token
@@ -428,12 +485,14 @@ class AuthManager:
                     self._status.pending = False
                     self._pending_device_code = None
                     self._status.last_event = "device_auth_created"
+                logger.info("AuthManager: authentication complete for account_id=%s", account_id)
             except Exception as e:
                 async with self._lock:
                     self._status.error = f"Failed to create/persist device auth: {e}"
                     self._status.pending = False
                     self._pending_device_code = None
                     self._status.last_event = "device_auth_failed"
+                logger.error("AuthManager: failed to create/persist device auth: %s", e)
             return
 
     async def _fetch_user_details(self, access_token: str, account_id: str) -> Dict[str, Any]:
@@ -458,6 +517,7 @@ class AuthManager:
         secret = data.get("secret")
         if not device_id or not secret:
             raise RuntimeError("Device auth response missing fields")
+        logger.info("AuthManager: device auth created for account_id=%s device_id=%s", account_id, device_id)
         return DeviceAuth(device_id=device_id, account_id=account_id, secret=secret)
 
     async def _persist_device_auth(
@@ -495,6 +555,7 @@ class AuthManager:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(content, indent=2), encoding="utf-8")
         tmp.replace(path)
+        logger.info("AuthManager: persisted device auth for key=%s at %s", key, str(path))
 
 
 __all__ = ["AuthManager", "EpicUser", "DeviceAuth", "AuthStatus"]
