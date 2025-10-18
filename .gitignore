@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data
+*.sqlite3
+*.db
+
+# Cache
+.cache/
+.mypy_cache/
+.pytype/
+
+# Device auth and secrets
+*.json
+!requirements.txt
