@@ -52,7 +52,8 @@ import aiohttp
 
 
 # Endpoints and constants for Epic OAuth
-OAUTH_BASE = "https://account-public-service-prod.ol.epicgames.com/account/api/oauth"
+# Use the 'prod03' host for OAuth endpoints as commonly used by device-auth flows
+OAUTH_BASE = "https://account-public-service-prod03.ol.epicgames.com/account/api/oauth"
 DEVICE_AUTHZ_ENDPOINT = f"{OAUTH_BASE}/deviceAuthorization"
 TOKEN_ENDPOINT = f"{OAUTH_BASE}/token"
 ACCOUNT_BASE = "https://account-public-service-prod.ol.epicgames.com/account/api"
@@ -70,7 +71,10 @@ ACCOUNT_BASE = "https://account-public-service-prod.ol.epicgames.com/account/api
 #
 # Note: We intentionally do not embed redirect/callback URLs. The device-code
 # flow is callback-less and safe for localhost usage.
-DEFAULT_SWITCH_BASIC_B64: str | None = None  # set to None to prefer ANDROID default unless provided via env
+# Provide a usable default for the SWITCH client to initiate the device flow.
+DEFAULT_SWITCH_BASIC_B64: str | None = (
+    "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
+)
 # Known public default for the Fortnite Android Game Client
 DEFAULT_ANDROID_BASIC_B64: str | None = (
     "ZWM2ODRiOGM2ODdmNDc5ZmFkZWEzY2IyYWQ4M2Y1YzY6OWE0OWYxMjQ1NWVhNGI4YTk2ZjRjZTZmYmFiYzIzZjk="
@@ -193,11 +197,25 @@ class AuthManager:
 
         return out
 
-    async def _request_device_code(self, session: aiohttp.ClientSession, basic_b64: str) -> Dict[str, Any]:
+    async def _client_credentials_token(self, session: aiohttp.ClientSession, basic_b64: str) -> Optional[str]:
         headers = {"Authorization": f"basic {basic_b64}", "Content-Type": "application/x-www-form-urlencoded"}
-        # Keep scope minimal and avoid redirect URIs; device flow is callback-less and localhost-safe
-        data = {"prompt": "login", "scope": "basic_profile"}
-        async with session.post(DEVICE_AUTHZ_ENDPOINT, headers=headers, data=data) as resp:
+        data = {"grant_type": "client_credentials"}
+        async with session.post(TOKEN_ENDPOINT, headers=headers, data=data) as resp:
+            try:
+                payload = await resp.json()
+            except Exception:
+                return None
+        return payload.get("access_token")
+
+    async def _request_device_code(self, session: aiohttp.ClientSession, basic_b64: str) -> Dict[str, Any]:
+        # Obtain an app access token first via client_credentials, then request a device code
+        app_token = await self._client_credentials_token(session, basic_b64)
+        if not app_token:
+            return {"error": "invalid_client", "error_description": "Failed to obtain app access token"}
+
+        headers = {"Authorization": f"bearer {app_token}", "Content-Type": "application/x-www-form-urlencoded"}
+        # The deviceAuthorization endpoint does not require a body for default scope
+        async with session.post(DEVICE_AUTHZ_ENDPOINT, headers=headers, data={}) as resp:
             payload: Dict[str, Any]
             try:
                 payload = await resp.json()
@@ -312,7 +330,40 @@ class AuthManager:
                     self._status.last_event = "token_payload_invalid"
                 return
 
-            # Fetch user details (email/display name) if possible
+            # If we started with SWITCH, exchange to ANDROID client for device-auth creation
+            if (self._used_platform or "").upper() != "ANDROID":
+                # Find ANDROID basic credential
+                android_b64: Optional[str] = None
+                for plat, b64 in self._resolve_basic_candidates():
+                    if plat == "ANDROID":
+                        android_b64 = b64
+                        break
+                try:
+                    if android_b64:
+                        # Get exchange code using current access token
+                        exch_url = f"{OAUTH_BASE}/exchange"
+                        async with session.get(exch_url, headers={"Authorization": f"bearer {access_token}"}) as r1:
+                            exch_payload = await r1.json()
+                        exch_code = (exch_payload or {}).get("code")
+                        if exch_code:
+                            # Exchange for ANDROID token
+                            headers2 = {"Authorization": f"basic {android_b64}", "Content-Type": "application/x-www-form-urlencoded"}
+                            data2 = {"grant_type": "exchange_code", "exchange_code": exch_code}
+                            async with session.post(TOKEN_ENDPOINT, headers=headers2, data=data2) as r2:
+                                android_token_payload = await r2.json()
+                            if android_token_payload.get("access_token"):
+                                access_token = android_token_payload.get("access_token")
+                                refresh_token = android_token_payload.get("refresh_token")
+                                account_id = android_token_payload.get("account_id") or account_id
+                                display_name = android_token_payload.get("display_name") or android_token_payload.get("displayName") or display_name
+                                async with self._lock:
+                                    self._used_platform = "ANDROID"
+                                    self._status.last_event = "exchanged_to_android"
+                except Exception:
+                    # If anything fails during exchange, continue with current token
+                    pass
+
+            # Fetch user details (email/display name) if possible using the final token
             email: Optional[str] = None
             try:
                 details = await self._fetch_user_details(access_token, account_id)
@@ -327,7 +378,7 @@ class AuthManager:
                 self._status.user = EpicUser(account_id=account_id, display_name=(display_name or account_id), email=email)
                 self._status.last_event = "device_flow_completed"
 
-            # Create DeviceAuth record for the account
+            # Create DeviceAuth record for the account using the final token
             try:
                 dev_auth = await self._create_device_auth(access_token, account_id)
                 await self._persist_device_auth(dev_auth, display_name=(display_name or account_id), email=email)
