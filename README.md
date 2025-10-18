@@ -1,29 +1,45 @@
 # Fortnite Bot Web UI (FastAPI)
 
-This project provides a simple web UI to control a Fortnite bot via browser-style chat commands. It exposes a FastAPI server with a WebSocket endpoint and a minimal command framework that mimics common commands such as `!hello`, `!skin`, `!emote`, `!pickaxe`, `!ready`, `!privacy`, `!playlist_id`, and `!stop`.
-
-Note: This repository ships with a lightweight, built-in command framework for the web UI. It is structured to be easily integrated with an actual Fortnite SDK (e.g., rebootpy) later. The current commands log actions and respond to the UI but do not perform real Fortnite party interactions.
+Interactive web interface to control a Fortnite bot from the browser with live status dashboard and Epic DeviceAuth login flow. Ships with a lightweight command framework compatible with a future `rebootpy` integration.
 
 ## Features
-- FastAPI app serving a single-page chat UI
-- WebSocket-based chat with broadcast to multiple clients
-- Minimal `WebCtx` with `send(text)` for command responses
-- Command prefix configurable via `COMMAND_PREFIX` env var (default: `!`)
+- Interactive SPA-like UI served by FastAPI (SSR template with vanilla JS)
+- Real-time chat over WebSocket (send/receive) with broadcast to all clients
+- Command help/autocomplete-ready endpoint exposing command registry
+- Live status dashboard:
+  - Bot: online/ready
+  - Auth: not authenticated, pending device code, authenticated as <display_name>, last error
+  - Party: members list, count, privacy, playlist
+- Epic DeviceAuth login flow (device code):
+  - `GET /auth/start` -> returns `verification_uri_complete` for the UI to open
+  - Server polls until the device code is approved; creates DeviceAuth and persists to `device_auths.json`
+  - `GET /auth/status` -> returns current auth status
+  - `POST /auth/logout` -> clears active session
+- Localhost-only by default; simple per-WS cooldown for spam prevention
 
 ## Project Structure
 - `bot/fortnite_bot.py`
   - Minimal bot, command registry, and cogs (`CosmeticCommands`, `PartyCommands`)
   - `create_bot()` and `start_bot()` exposed for server startup
+  - Status emitter so the server can broadcast bot/party deltas in real time
 - `server/main.py`
-  - FastAPI app with routes and WebSocket handling
+  - FastAPI app with REST endpoints, WebSocket `/ws`, live status broadcasting
+- `server/auth.py`
+  - Epic DeviceAuth flow helper (see licensing notice inside the file)
 - `server/webctx.py`
   - Thin wrapper re-exporting `WebCtx` to keep a single context implementation
-- `templates/index.html`
-  - Chat UI page
-- `static/app.js`, `static/styles.css`
-  - Frontend logic and styling
+- `templates/index.html` + `static/*`
+  - SSR web UI + scripts and styles (no build step required)
 - `run.py`
   - Convenience script to launch the FastAPI app via `uvicorn`
+
+## Endpoints
+- `GET /` – Web UI
+- `GET /ws` – WebSocket for chat and live status updates
+- `GET /auth/start` – Begin Epic device auth; JSON includes `verification_uri_complete`
+- `GET /auth/status` – Current auth state
+- `POST /auth/logout` – Clear active auth state
+- `GET /commands` – Bot command registry (names, aliases, help)
 
 ## Requirements
 - Python 3.10+
@@ -37,7 +53,7 @@ source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 ```
 
-Run the web server:
+Run the web server (localhost-only by default):
 
 ```bash
 uvicorn server.main:app --reload
@@ -48,20 +64,21 @@ python run.py
 Open http://localhost:8000 and test commands like:
 - `!hello`
 - `!skin Nog Ops`
-- `!emote Floss`
-- `!pickaxe Candy Axe`
 - `!ready`
-- `!privacy public`
-- `!playlist_id playlist_defaultsolo`
-- `!stop`
+- `!privacy private`
+
+## Configuration
+- `COMMAND_PREFIX`: Command prefix (default `!`).
+- `EPIC_CLIENT_ID` / `EPIC_CLIENT_SECRET`: OAuth client credentials used for device code flow.
 
 ## Notes for integrating with a real Fortnite bot
-- The `WebCtx` class provides a `send(text)` method that commands use to reply. This mirrors the `ctx.send(...)` pattern found in common bot frameworks and should be straightforward to adapt.
-- The current code does not establish any Fortnite session or device authentication. To integrate with an SDK such as `rebootpy`, refactor `bot/fortnite_bot.py` so the `Bot` class internally manages the SDK client and cogs call into it. Keep `create_bot()` and `start_bot()` as the public API used by the FastAPI app.
-- Keep the `COMMAND_PREFIX` the same across CLI and web usage to avoid confusion.
+- The current commands simulate actions and log to the console. Integrate your Fortnite SDK (e.g., `rebootpy`) inside `Bot` and its cogs. Do not change command signatures so that both in-game/DM and web UI control remain compatible.
+- `WebCtx` provides `send(text)` and `author` to mirror typical bot framework `Context`.
 
-## Safety & Rate Limiting
-- The WebSocket endpoint applies a simple per-connection cooldown to avoid spam.
+## Security
+- CORS intentionally limited to same-origin. Bind uvicorn to `127.0.0.1` during development.
+- The device auth file `device_auths.json` is ignored by git (see `.gitignore`).
 
 ## License
-MIT
+- Project code: MIT (see LICENSE)
+- `server/auth.py`: includes a license/notice reflecting Commons Clause + Apache 2.0 Modified terms commonly used by device-auth generators. See NOTICE for details.

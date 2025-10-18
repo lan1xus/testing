@@ -10,10 +10,50 @@
   <div id="app">
     <header>
       <h1>Fortnite Bot Web UI</h1>
-      <p>Type commands like <code>!hello</code>, <code>!skin Nog Ops</code>, <code>!emote Floss</code></p>
+      <p>Type commands like <code>!hello</code>, <code>!skin Nog Ops</code>, <code>!ready</code>, <code>!privacy private</code></p>
+      <div id="status-bar">
+        <div class="status-card">
+          <div class="status-title">Bot</div>
+          <div class="status-value" id="bot-status">offline</div>
+        </div>
+        <div class="status-card">
+          <div class="status-title">Auth</div>
+          <div class="status-value" id="auth-status">not authenticated</div>
+          <div id="auth-actions">
+            <button id="login-btn" type="button">Iniciar sesión en Epic</button>
+            <button id="logout-btn" type="button">Logout</button>
+            <button id="refresh-btn" type="button">Refresh</button>
+            <a id="verify-link" href="#" target="_blank" rel="noopener" style="display:none;">Open verification</a>
+          </div>
+        </div>
+        <div class="status-card">
+          <div class="status-title">Party</div>
+          <div class="status-value"><span id="party-count">0</span> members</div>
+        </div>
+        <div class="status-card">
+          <div class="status-title">Controls</div>
+          <div class="status-value">
+            <button id="stop-bot-btn" type="button" style="background:#d23a3a;">Stop Bot</button>
+          </div>
+        </div>
+      </div>
     </header>
     <main>
-      <div id="messages" aria-live="polite"></div>
+      <section id="panels">
+        <div class="panel">
+          <h2>Party Members</h2>
+          <ul id="party-members"></ul>
+          <div class="small">Privacy: <span id="party-privacy">-</span> | Playlist: <span id="party-playlist">-</span> | In match: <span id="party-inmatch">false</span></div>
+        </div>
+        <div class="panel">
+          <h2>Command Help</h2>
+          <input id="cmd-filter" type="text" placeholder="Filter commands..." />
+          <ul id="cmd-list"></ul>
+        </div>
+      </section>
+      <section>
+        <div id="messages" aria-live="polite"></div>
+      </section>
     </main>
     <footer>
       <form id="chat-form">
